@@ -4,6 +4,19 @@ Alle wichtigen Änderungen an Shutter Pilot werden in dieser Datei dokumentiert.
 
 Das Format basiert auf [Keep a Changelog](https://keepachangelog.com/de/1.1.0/).
 
+## [2.43.0]
+
+### Neu
+- **Verzögerung beim Öffnen des Fensters.** Manche Fenstersensoren melden „gekippt“ und „offen“
+  nacheinander, mit Verzögerung. Der Rollladen fuhr dann auf die erste Meldung und gleich darauf
+  auf die zweite. Neu: `window_open_delay` (0–30 s, Vorgabe 0 = wie bisher), am Rollladen im
+  Fensterbereich direkt unter der Schließ-Entprellung. Die Wartezeit beginnt mit der ersten
+  Meldung; danach wird der Kontakt neu gelesen und der Rollladen fährt einmal in die Position,
+  die zum Zustand am Ende passt. Ein Wechsel zwischen „gekippt“ und „offen“ startet die Wartezeit
+  nicht neu, nur „geschlossen“ bricht sie ab (dann wird nichts gefahren). Reload, Entladen und
+  eine ausgeschaltete Rollladen-Automatik verwerfen eine laufende Wartezeit. Bei Markisen und
+  Dachfenstern wird der Wert wie die Schließ-Entprellung nicht verwendet. In allen elf Sprachen.
+
 ## [2.42.0]
 
 ### Neu

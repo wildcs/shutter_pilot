@@ -64,15 +64,26 @@ CONF_POSITION_WHEN_WINDOW_TILTED = "position_when_window_tilted"
 # so window triggers and ventilation work there too – they would otherwise
 # bail out the moment they cannot read the cover.
 CONF_BLIND_DRIVE = "blind_drive"
-
 CONF_LOCK_PROTECTION = "lock_protection"
 CONF_MIN_POSITION_WHEN_OPEN = "min_position_when_open"
+
 # Turning the handle from "tilted" to "open" drags the contact through
 # "closed" for a moment. Without a wait the shutter drives back right away and
 # never reaches the open position. Seconds, 0 disables the wait.
 CONF_WINDOW_CLOSE_DEBOUNCE = "window_close_debounce"
 DEFAULT_WINDOW_CLOSE_DEBOUNCE = 5
 MAX_WINDOW_CLOSE_DEBOUNCE = 30
+
+# The opposite direction: how long a window has to stay "open" or "tilted"
+# before the shutter reacts. Some sensors report the two states one after the
+# other, with a delay (tilted first, open a moment later, or the other way
+# round). Without a wait the shutter drives to the first position it hears of
+# and then right on to the second. After the wait the contact is read again and
+# the shutter drives once, to what the window really is. Seconds, 0 disables
+# the wait, which is exactly the behaviour from before this setting existed.
+CONF_WINDOW_OPEN_DELAY = "window_open_delay"
+DEFAULT_WINDOW_OPEN_DELAY = 0
+MAX_WINDOW_OPEN_DELAY = 60
 
 # Minutes before the next scheduled opening within which a closing window does
 # not bring the shutter back down. Someone who airs the bathroom at half past

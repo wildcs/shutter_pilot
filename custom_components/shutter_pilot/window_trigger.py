@@ -16,6 +16,7 @@ from .const import (
     CONF_SHUTTERS,
     CONF_COVER_ENTITY_ID,
     CONF_WINDOW_CLOSE_DEBOUNCE,
+    CONF_WINDOW_OPEN_DELAY,
     CONF_WINDOW_CLOSE_DELAY_MINUTES,
     CONF_WINDOW_KEEP_OPEN_MINUTES,
     CONF_WINDOW_REACT,
@@ -29,7 +30,9 @@ from .const import (
     CONF_POSITION_CLOSED,
     CONF_POSITION_OPEN,
     DEFAULT_WINDOW_CLOSE_DEBOUNCE,
+    DEFAULT_WINDOW_OPEN_DELAY,
     MAX_WINDOW_CLOSE_DEBOUNCE,
+    MAX_WINDOW_OPEN_DELAY,
     MAX_WINDOW_CLOSE_DELAY_MINUTES,
     MAX_WINDOW_KEEP_OPEN_MINUTES,
     CONF_AREAS,
@@ -103,6 +106,15 @@ def _debounce_seconds(shutter: dict) -> int:
     return max(0, min(MAX_WINDOW_CLOSE_DEBOUNCE, value))
 
 
+def _open_delay_seconds(shutter: dict) -> int:
+    """How long "open"/"tilted" has to settle before we act on it."""
+    try:
+        value = int(shutter.get(CONF_WINDOW_OPEN_DELAY, DEFAULT_WINDOW_OPEN_DELAY) or 0)
+    except (TypeError, ValueError):
+        return DEFAULT_WINDOW_OPEN_DELAY
+    return max(0, min(MAX_WINDOW_OPEN_DELAY, value))
+
+
 def _close_delay_seconds(shutter: dict) -> int:
     """Debounce plus the configured "I'll be right back" wait, in seconds."""
     try:
@@ -164,15 +176,30 @@ def cancel_window_close(data: dict[str, Any], entity_id: str) -> None:
         task.cancel()
 
 
-def cancel_all_window_close(data: dict[str, Any]) -> None:
-    """Drop every pending close reaction, for unload and reload."""
-    tasks = data.get("_window_close_tasks")
+def cancel_window_open(data: dict[str, Any], entity_id: str) -> None:
+    """Drop a pending open reaction, e.g. because the window closed again."""
+    tasks = data.get("_window_open_tasks")
     if not isinstance(tasks, dict):
         return
-    for task in list(tasks.values()):
-        if not task.done():
-            task.cancel()
-    tasks.clear()
+    task = tasks.pop(entity_id, None)
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def cancel_all_window_close(data: dict[str, Any]) -> None:
+    """Drop every pending close and open reaction, for unload and reload.
+
+    The pending open reactions are dropped here as well, so every existing
+    caller (unload, reload) covers them without having to know about them.
+    """
+    for key in ("_window_close_tasks", "_window_open_tasks"):
+        tasks = data.get(key)
+        if not isinstance(tasks, dict):
+            continue
+        for task in list(tasks.values()):
+            if not task.done():
+                task.cancel()
+        tasks.clear()
 
 
 # Liegt in window_helper, seit der Export dieselbe Frage stellt.
@@ -347,6 +374,160 @@ async def setup_window_triggers(hass: HomeAssistant, entry: ConfigEntry) -> None
                 tasks.pop(cover_entity, None)
 
     @callback
+    def _apply_window_opened(shutter: dict, cover_entity: str, window_state: str) -> None:
+        """React to a window that is open or tilted: drive to its position.
+
+        Shared by the immediate path and by the delayed one (window_open_delay),
+        so both run exactly the same checks and drive exactly the same way.
+        """
+        target_pos = _get_target_position_for_window_state(shutter, window_state)
+        if target_pos is None:
+            return
+        # Window open or tilted -> only drive to target if the cover is (nearly) closed.
+        # Rationale: During daytime (cover already opened by automation), opening a window/door
+        # must NOT force the cover into a "ventilation" position.
+        cycle_active = trigger_actions.get(cover_entity) == "triggered"
+        # Die Abendfahrt bei offenem Fenster parkt den Rollladen auf
+        # der Lueftungsposition und merkt die Vollfahrt vor, startet
+        # aber keinen Fenstertrigger-Zyklus. Er steht dort *wegen*
+        # des Fensters, nicht weil er tagsueber offen waere - die
+        # Richtungspruefung unten haelt ihn faelschlich fuer einen
+        # offenen Rollladen und liess „offen -> gekippt" ins Leere
+        # laufen (bjoerg, 95 % statt 30 %). Nur mit dem Haken
+        # „schon auf Lueftungsposition fahren": ohne ihn soll der
+        # Rollladen bei offenem Fenster bewusst stehen bleiben.
+        waiting_for_window = bool(
+            shutter.get(CONF_WINDOW_VENT_WHILE_OPEN, False)
+            and cover_entity in data.get("drive_after_close_pending", {})
+        )
+        current_pos = get_tracked_position(hass, shutter, cover_entity)
+        if current_pos is None:
+            # Fail-safe: if we can't read current position, do nothing.
+            trigger_actions.pop(cover_entity, None)
+            trigger_heights.pop(cover_entity, None)
+            return
+        # Der Aussperrschutz galt an jedem automatisierten Fahrweg –
+        # ausser an diesem, dem einzigen, der ausschliesslich bei
+        # offenem Fenster faehrt. Eine Kipp-Position unterhalb der
+        # Mindesthoehe schloss den Rollladen damit vor der offenen
+        # Terrassentuer, genau was die Einstellung verhindern soll.
+        target_pos = get_effective_close_position(hass, shutter, target_pos)
+        # Shading counts as a reason to react, whatever the position.
+        # The order is window contact > shading > ventilation, but the
+        # contact could not reach a shaded shutter at all: shading
+        # parks it at, say, 25 %, which is neither closed nor open, so
+        # the check below sent it away. Opening the terrace door in the
+        # afternoon then left the shutter hanging in front of it.
+        shaded = is_cover_sun_protected(
+            data, cover_entity
+        ) and not _is_cover_effectively_open(shutter, current_pos)
+        # Die Pruefung war richtungsblind, und das war der Fehler: sie
+        # soll verhindern, dass ein offenes Fenster einen offenen
+        # Rollladen herunterzieht. Nach *oben* faehrt hier aber nur der
+        # Aussperrschutz, und der ist der Grund, aus dem jemand diesen
+        # Haken setzt. Ein von Hand auf halber Hoehe geparkter
+        # Rollladen blieb damit vor der offenen Terrassentuer stehen –
+        # dieselbe Blindheit wie bei shading_would_open_cover() (2.15.0),
+        # nur an der anderen Seite.
+        opens_cover = target_pos > current_pos and positions_differ_significantly(
+            target_pos, current_pos
+        )
+        if (
+            not cycle_active
+            and not waiting_for_window
+            and not shaded
+            and not opens_cover
+            and not _is_cover_effectively_closed(shutter, current_pos)
+        ):
+            # Not in "closed" state -> no window-trigger cycle active.
+            # Clear stale cycle markers so a later "closed" event cannot restore/close.
+            trigger_actions.pop(cover_entity, None)
+            trigger_heights.pop(cover_entity, None)
+            return
+
+        if not cycle_active:
+            # Remember the height only when the cycle starts. Going
+            # from tilted to open would otherwise make the ventilation
+            # position the height we restore to later.
+            #
+            # Gemerkt wird, wo der Rollladen *steht*, nicht die
+            # Momentaufnahme eines fahrenden. Wer abends das Fenster
+            # oeffnet, waehrend die Abendfahrt noch laeuft, bekam sonst
+            # eine Zwischenstellung als Rueckfahrhoehe – c.radis 74 %,
+            # eine Zahl, die in keiner seiner Einstellungen steht.
+            trigger_heights[cover_entity] = resting_position(
+                hass, data, shutter, cover_entity
+            )
+        trigger_actions[cover_entity] = "triggered"
+        if window_state == "tilted":
+            reason = "Window tilted"
+        elif not _has_tilt_state(shutter):
+            reason = "Window opened (2-state ventilation)"
+        else:
+            reason = "Window opened"
+        hass.async_create_task(
+            set_cover_position(hass, entry, cover_entity, target_pos, reason)
+        )
+
+    async def _delayed_open(shutter: dict, cover_entity: str, delay: int) -> None:
+        """Wait until the contact has reported both of its states, then react.
+
+        Some window sensors send "tilted" and "open" one after the other.
+        Reacting to the first message drives the shutter to the wrong position
+        and straight on to the second one. Waiting and reading the contact
+        again drives once, to what the window really is. A change between
+        "tilted" and "open" while waiting does not restart the wait (see
+        _schedule_open): the state is read at the end anyway. Only "closed"
+        ends it early, by cancelling this task.
+        """
+        try:
+            await asyncio.sleep(delay)
+            # Re-read instead of trusting the event that started the wait: the
+            # window may have been closed, or have changed from tilted to open.
+            window_state = get_window_state(hass, shutter)
+            if window_state not in ("open", "tilted"):
+                # Closed again: the event handler has taken care of that.
+                return
+            if not shutter.get(CONF_WINDOW_REACT, DEFAULT_WINDOW_REACT):
+                return
+            if not is_system_enabled(hass, entry):
+                return
+            if not is_shutter_automation_enabled(hass, entry, shutter):
+                return
+            if not automation_allowed(hass, entry, shutter):
+                return
+            _apply_window_opened(shutter, cover_entity, window_state)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover - one window must not break others
+            _LOGGER.exception("Delayed window open failed for %s", cover_entity)
+        finally:
+            tasks = data.get("_window_open_tasks")
+            # Only drop our own entry - a newer task may already have replaced
+            # us in the dict while this one was being cancelled.
+            if isinstance(tasks, dict) and tasks.get(cover_entity) is asyncio.current_task():
+                tasks.pop(cover_entity, None)
+
+    def _schedule_open(shutter: dict, cover_entity: str, window_state: str) -> None:
+        delay = _open_delay_seconds(shutter)
+        if delay <= 0:
+            # No task, no await: exactly the order of events we had before
+            # the open delay existed.
+            _apply_window_opened(shutter, cover_entity, window_state)
+        else:
+            pending = data.get("_window_open_tasks", {}).get(cover_entity)
+            if pending is not None and not pending.done():
+                # The wait is already running. open <-> tilted must not start
+                # it over, otherwise a sensor that keeps reporting one state
+                # after the other would never get past the delay. The state is
+                # read when the wait ends. Only "closed" cancels it, in the
+                # event handler.
+                return
+            data.setdefault("_window_open_tasks", {})[cover_entity] = (
+                hass.async_create_task(_delayed_open(shutter, cover_entity, delay))
+            )
+
+    @callback
     def _on_window_state_change(event) -> None:
         if not is_system_enabled(hass, entry):
             return
@@ -369,6 +550,7 @@ async def setup_window_triggers(hass: HomeAssistant, entry: ConfigEntry) -> None
             # the moment the automation is switched back on.
             if not is_shutter_automation_enabled(hass, entry, shutter):
                 cancel_window_close(data, cover_entity)
+                cancel_window_open(data, cover_entity)
                 forget_drive_after_close(hass, entry, data, cover_entity)
                 trigger_actions.pop(cover_entity, None)
                 trigger_heights.pop(cover_entity, None)
@@ -398,95 +580,17 @@ async def setup_window_triggers(hass: HomeAssistant, entry: ConfigEntry) -> None
             ):
                 continue
 
-            target_pos = _get_target_position_for_window_state(shutter, window_state)
-
-            if window_state in ("open", "tilted") and target_pos is not None:
-                # Window open or tilted -> only drive to target if the cover is (nearly) closed.
-                # Rationale: During daytime (cover already opened by automation), opening a window/door
-                # must NOT force the cover into a "ventilation" position.
-                cycle_active = trigger_actions.get(cover_entity) == "triggered"
-                # Die Abendfahrt bei offenem Fenster parkt den Rollladen auf
-                # der Lueftungsposition und merkt die Vollfahrt vor, startet
-                # aber keinen Fenstertrigger-Zyklus. Er steht dort *wegen*
-                # des Fensters, nicht weil er tagsueber offen waere - die
-                # Richtungspruefung unten haelt ihn faelschlich fuer einen
-                # offenen Rollladen und liess „offen -> gekippt" ins Leere
-                # laufen (bjoerg, 95 % statt 30 %). Nur mit dem Haken
-                # „schon auf Lueftungsposition fahren": ohne ihn soll der
-                # Rollladen bei offenem Fenster bewusst stehen bleiben.
-                waiting_for_window = bool(
-                    shutter.get(CONF_WINDOW_VENT_WHILE_OPEN, False)
-                    and cover_entity in data.get("drive_after_close_pending", {})
-                )
-                current_pos = get_tracked_position(hass, shutter, cover_entity)
-                if current_pos is None:
-                    # Fail-safe: if we can't read current position, do nothing.
-                    trigger_actions.pop(cover_entity, None)
-                    trigger_heights.pop(cover_entity, None)
-                    continue
-                # Der Aussperrschutz galt an jedem automatisierten Fahrweg –
-                # ausser an diesem, dem einzigen, der ausschliesslich bei
-                # offenem Fenster faehrt. Eine Kipp-Position unterhalb der
-                # Mindesthoehe schloss den Rollladen damit vor der offenen
-                # Terrassentuer, genau was die Einstellung verhindern soll.
-                target_pos = get_effective_close_position(hass, shutter, target_pos)
-                # Shading counts as a reason to react, whatever the position.
-                # The order is window contact > shading > ventilation, but the
-                # contact could not reach a shaded shutter at all: shading
-                # parks it at, say, 25 %, which is neither closed nor open, so
-                # the check below sent it away. Opening the terrace door in the
-                # afternoon then left the shutter hanging in front of it.
-                shaded = is_cover_sun_protected(
-                    data, cover_entity
-                ) and not _is_cover_effectively_open(shutter, current_pos)
-                # Die Pruefung war richtungsblind, und das war der Fehler: sie
-                # soll verhindern, dass ein offenes Fenster einen offenen
-                # Rollladen herunterzieht. Nach *oben* faehrt hier aber nur der
-                # Aussperrschutz, und der ist der Grund, aus dem jemand diesen
-                # Haken setzt. Ein von Hand auf halber Hoehe geparkter
-                # Rollladen blieb damit vor der offenen Terrassentuer stehen –
-                # dieselbe Blindheit wie bei shading_would_open_cover() (2.15.0),
-                # nur an der anderen Seite.
-                opens_cover = target_pos > current_pos and positions_differ_significantly(
-                    target_pos, current_pos
-                )
-                if (
-                    not cycle_active
-                    and not waiting_for_window
-                    and not shaded
-                    and not opens_cover
-                    and not _is_cover_effectively_closed(shutter, current_pos)
-                ):
-                    # Not in "closed" state -> no window-trigger cycle active.
-                    # Clear stale cycle markers so a later "closed" event cannot restore/close.
-                    trigger_actions.pop(cover_entity, None)
-                    trigger_heights.pop(cover_entity, None)
-                    continue
-
-                if not cycle_active:
-                    # Remember the height only when the cycle starts. Going
-                    # from tilted to open would otherwise make the ventilation
-                    # position the height we restore to later.
-                    #
-                    # Gemerkt wird, wo der Rollladen *steht*, nicht die
-                    # Momentaufnahme eines fahrenden. Wer abends das Fenster
-                    # oeffnet, waehrend die Abendfahrt noch laeuft, bekam sonst
-                    # eine Zwischenstellung als Rueckfahrhoehe – c.radis 74 %,
-                    # eine Zahl, die in keiner seiner Einstellungen steht.
-                    trigger_heights[cover_entity] = resting_position(
-                        hass, data, shutter, cover_entity
-                    )
-                trigger_actions[cover_entity] = "triggered"
-                if window_state == "tilted":
-                    reason = "Window tilted"
-                elif not _has_tilt_state(shutter):
-                    reason = "Window opened (2-state ventilation)"
-                else:
-                    reason = "Window opened"
-                hass.async_create_task(
-                    set_cover_position(hass, entry, cover_entity, target_pos, reason)
-                )
+            if window_state in ("open", "tilted") and (
+                _get_target_position_for_window_state(shutter, window_state)
+                is not None
+            ):
+                # Window open or tilted -> drive to the target position, but
+                # only once the state has held for the configured open delay.
+                _schedule_open(shutter, cover_entity, window_state)
             elif window_state == "closed":
+                # Closed before the open delay ran out: nothing was driven, so
+                # the pending open reaction simply has to go.
+                cancel_window_open(data, cover_entity)
                 # Window closed -> restore saved position OR execute drive_after_close,
                 # but only once "closed" has held for the configured time.
                 _schedule_close(shutter, cover_entity, pos_closed)
