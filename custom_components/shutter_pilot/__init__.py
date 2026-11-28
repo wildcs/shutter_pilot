@@ -112,6 +112,8 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Set up the Shutter Pilot component."""
     hass.data.setdefault(DOMAIN, {})
+    await _async_register_panel(hass)
+    _async_register_websocket(hass)
     return True
 
 
@@ -352,14 +354,21 @@ async def _async_register_panel(hass: HomeAssistant) -> None:
     """Register the Shutter Pilot sidebar panel (idempotent)."""
     if hass.data.get(f"{DOMAIN}_panel_registered"):
         return
-    hass.data[f"{DOMAIN}_panel_registered"] = True
 
     panel_dir = os.path.join(os.path.dirname(__file__), "frontend")
     panel_file = os.path.join(panel_dir, "shutter-pilot-panel.js")
 
-    await hass.http.async_register_static_paths(
-        [StaticPathConfig(PANEL_URL, panel_file, cache_headers=False)]
-    )
+    try:
+        await hass.http.async_register_static_paths(
+            [StaticPathConfig(PANEL_URL, panel_file, cache_headers=False)]
+        )
+    except RuntimeError:
+        _LOGGER.debug(
+            "HTTP router already frozen; skipping static path registration until restart"
+        )
+        return
+
+    hass.data[f"{DOMAIN}_panel_registered"] = True
 
     async_register_built_in_panel(
         hass,
@@ -367,13 +376,6 @@ async def _async_register_panel(hass: HomeAssistant) -> None:
         sidebar_title=PANEL_TITLE,
         sidebar_icon=PANEL_ICON,
         frontend_url_path="shutter-pilot",
-        # Das Panel bleibt für alle Benutzer sichtbar: Es ist zugleich die
-        # Bedienoberfläche für die Rollläden (hoch, runter, Sonnenschutz,
-        # Lüften) und die läuft über die normalen cover-Dienste, für die Home
-        # Assistant selbst die Rechte prüft. Konfiguriert werden kann hier
-        # nichts ohne Administratorrechte: Jeder ändernde WebSocket-Befehl
-        # trägt @websocket_api.require_admin, und das Panel blendet die
-        # Konfigurationsbereiche bei Nicht-Administratoren aus.
         require_admin=False,
         config={
             "shutter_pilot_version": PANEL_ASSET_VERSION,
@@ -386,6 +388,7 @@ async def _async_register_panel(hass: HomeAssistant) -> None:
         },
     )
     _LOGGER.debug("Shutter Pilot sidebar panel registered")
+
 
 
 # ---------------------------------------------------------------------------
