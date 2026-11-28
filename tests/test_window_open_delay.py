@@ -22,6 +22,7 @@ from custom_components.shutter_pilot import window_trigger
 from custom_components.shutter_pilot.const import (
     CONF_WINDOW_CLOSE_DEBOUNCE,
     CONF_WINDOW_OPEN_DELAY,
+    MAX_WINDOW_OPEN_DELAY,
 )
 from tests.test_window_debounce import (  # noqa: F401 - cover_calls ist ein Fixture
     COVER,
@@ -182,8 +183,8 @@ class TestClamping:
             (-5, 0),
             (0, 0),
             (7, 7),
-            (30, 30),
-            (999, 30),
+            (MAX_WINDOW_OPEN_DELAY, MAX_WINDOW_OPEN_DELAY),
+            (MAX_WINDOW_OPEN_DELAY + 999, MAX_WINDOW_OPEN_DELAY),
             ("abc", 0),
             (None, 0),
             ("", 0),

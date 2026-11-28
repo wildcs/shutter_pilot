@@ -101,15 +101,18 @@ console.log("— Benutztes bleibt sichtbar, nichts wird angefasst —");
   const full = shutters[0];
   const snap = JSON.stringify(full);
   p._editShutter = { ...full, _index: 0, privacy_entity: "switch.sicht", open_stage2: true, reference_run: true,
-    position_closed_alt: 40, window_keep_open_minutes: 20, window_close_debounce: 12 };
+    position_closed_alt: 40, window_keep_open_minutes: 20, window_close_debounce: 12, window_open_delay: 10 };
   const sh = render(p._renderShutterForm(p._data));
   const shWant = ["sec_shutter_sun", "sec_slats", "sec_storm", "sec_frostlock", "f_privacy_entity", "f_open2_time",
     "f_refrun_days", "f_pos_closed_alt_val", "f_window_react", "f_drive_after_up", "f_win_debounce",
-    "f_win_keep_open", "f_blind_drive", "f_lock_entity"];
+    "f_win_open_delay", "f_win_keep_open", "f_blind_drive", "f_lock_entity"];
   ok("Rollladen mit allem: Benutztes steht da", has(sh, shWant).length === shWant.length,
      "fehlt: " + shWant.filter(k => !sh.includes(k)).join(", "));
   ok("… Unbenutztes (Rückfahrt verzögern) fehlt", !sh.includes("f_win_close_delay"));
   ok("das Rendern aendert den Rollladen nicht", JSON.stringify(full) === snap);
+   p._editShutter = { ...full, _index: 0, window_open_delay: 0 };
+  const sh0 = render(p._renderShutterForm(p._data));
+  ok("… Oeffnungsverzoegerung auf Vorgabe: in der einfachen Ansicht weg", !sh0.includes("f_win_open_delay"));
   p._editShutter = null;
 
   const setOut = render(p._renderSettings(p._data));
